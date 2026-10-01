@@ -49,6 +49,23 @@ class DomainService:
         )
         merged = dict(entity["data"])
         merged.update(patch)
+        kind = self.rules.normalize_kind(entity["kind"])
+        if kind == "candidate" and action in ("merge_measurement", "reclassify"):
+            old_priority = entity["data"].get("priority_score")
+            new_priority = merged.get("priority_score")
+            invalidate = old_priority != new_priority
+            updated, _invalidated = self.repository.apply_candidate_transition(
+                entity_id,
+                expected,
+                next_status,
+                merged,
+                actor,
+                action,
+                entity["status"],
+                {"patch": patch},
+                invalidate=invalidate,
+            )
+            return updated
         updated = self.repository.update_entity(entity_id, expected, next_status, merged)
         self.audit.record(
             entity_id,

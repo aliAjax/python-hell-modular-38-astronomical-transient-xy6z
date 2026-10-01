@@ -140,22 +140,118 @@ class SQLiteRepository:
             connection.close()
         return self.get_entity(entity_id)
 
+    def _append_audit(self, connection, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
+        connection.execute(
+            "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                entity_id,
+                actor_id,
+                actor_role,
+                action,
+                from_status,
+                to_status,
+                json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                utcnow(),
+            ),
+        )
+
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:
-            connection.execute(
-                "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    entity_id,
-                    actor_id,
-                    actor_role,
-                    action,
-                    from_status,
-                    to_status,
-                    json.dumps(detail, ensure_ascii=False, sort_keys=True),
-                    utcnow(),
-                ),
+            self._append_audit(
+                connection,
+                entity_id,
+                actor_id,
+                actor_role,
+                action,
+                from_status,
+                to_status,
+                detail,
             )
+
+    def apply_candidate_transition(
+        self,
+        entity_id,
+        expected_version,
+        status,
+        data,
+        actor,
+        action,
+        from_status,
+        detail,
+        invalidate,
+    ):
+        """Atomically update a candidate and invalidate its requested observations.
+
+        The candidate update uses optimistic locking (version check). Requested
+        observations for the candidate are moved to pending_review in the same
+        transaction, guarded by status so a concurrent schedule is never lost or
+        overwritten. Audit entries for the candidate and each invalidated
+        observation are written in the same transaction.
+        """
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT version FROM entities WHERE id = ?", (entity_id,)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("entity not found: " + entity_id)
+            current_version = int(row["version"])
+            if expected_version is not None and current_version != int(expected_version):
+                raise ConflictError(
+                    "version changed: expected %s, found %s; retry with the latest entity"
+                    % (expected_version, current_version)
+                )
+            connection.execute(
+                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ? AND version = ?",
+                (status, payload, now, entity_id, current_version),
+            )
+            invalidated = []
+            if invalidate:
+                rows = connection.execute(
+                    "SELECT id FROM entities WHERE kind = 'observation' AND status = 'requested' "
+                    "AND json_extract(data, '$.candidate_id') = ?",
+                    (entity_id,),
+                ).fetchall()
+                for item in rows:
+                    observation_id = item["id"]
+                    connection.execute(
+                        "UPDATE entities SET status = 'pending_review', version = version + 1, updated_at = ? "
+                        "WHERE id = ? AND status = 'requested'",
+                        (now, observation_id),
+                    )
+                    invalidated.append(observation_id)
+                    self._append_audit(
+                        connection,
+                        observation_id,
+                        actor.user_id,
+                        actor.role,
+                        "priority_review",
+                        "requested",
+                        "pending_review",
+                        {"reason": "candidate priority changed", "candidate_id": entity_id},
+                    )
+            self._append_audit(
+                connection,
+                entity_id,
+                actor.user_id,
+                actor.role,
+                action,
+                from_status,
+                status,
+                detail,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(entity_id), invalidated
 
     def list_audit(self, entity_id=None):
         with self._connect() as connection:

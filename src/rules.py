@@ -111,9 +111,19 @@ def _validate_merge_measurement(actor, entity, data, lookup):
 
 
 def _validate_reclassify(actor, entity, data, lookup):
-    if data.get("new_type") not in {"grb", "supernova", "tde", "variable", "unknown"}:
+    new_type = data.get("new_type")
+    if new_type not in {"grb", "supernova", "tde", "variable", "unknown"}:
         raise ValidationError("unsupported transient type")
-    return {"transient_type": data["new_type"], "previous_type": entity["data"].get("transient_type")}
+    priority = entity["data"].get("priority_score")
+    measurements = entity["data"].get("measurements") or []
+    if measurements:
+        latest = sorted(measurements, key=lambda item: item["observed_at"])[-1]
+        priority = calculate_priority(latest["magnitude"], new_type)
+    return {
+        "transient_type": new_type,
+        "previous_type": entity["data"].get("transient_type"),
+        "priority_score": priority,
+    }
 
 
 def _validate_correct(actor, entity, data, lookup):
@@ -122,29 +132,62 @@ def _validate_correct(actor, entity, data, lookup):
     return {"corrected_by": actor.user_id}
 
 
+def _validate_confirm(actor, entity, data, lookup):
+    # Review confirmation releases the slot hold and returns the observation to
+    # the waiting pool so it re-competes by the latest priority.
+    return {"confirmed_by": actor.user_id}
+
+
+def _slot_overlaps(start, end, other):
+    return measurements_overlap(
+        start, end, other["data"].get("start_at"), other["data"].get("end_at")
+    )
+
+
 def _validate_schedule(actor, entity, data, lookup):
-    observations = lookup("observation", "telescope_id", entity["data"].get("telescope_id")) if lookup else []
-    for other in observations:
-        if other["id"] == entity["id"] or other["status"] != "scheduled":
+    obs = entity["data"]
+    telescope_id = obs.get("telescope_id")
+    team_id = obs.get("team_id")
+    start = obs.get("start_at")
+    end = obs.get("end_at")
+    candidate = _find_one(lookup, "candidate", "id", obs.get("candidate_id"))
+    my_priority = candidate["data"].get("priority_score") if candidate else None
+
+    telescope_observations = lookup("observation", "telescope_id", telescope_id) if lookup else []
+    team_observations = lookup("observation", "team_id", team_id) if lookup else []
+
+    # A slot is firmly occupied by scheduled observations and held by
+    # pending_review observations while their review is in progress.
+    for other in telescope_observations:
+        if other["id"] == entity["id"]:
             continue
-        if measurements_overlap(
-            entity["data"].get("start_at"),
-            entity["data"].get("end_at"),
-            other["data"].get("start_at"),
-            other["data"].get("end_at"),
-        ):
-            raise ConflictError("telescope is already scheduled in this window")
-    team_observations = lookup("observation", "team_id", entity["data"].get("team_id")) if lookup else []
+        if other["status"] in ("scheduled", "pending_review") and _slot_overlaps(start, end, other):
+            raise ConflictError("telescope is already reserved in this window")
     for other in team_observations:
-        if other["id"] == entity["id"] or other["status"] != "scheduled":
+        if other["id"] == entity["id"]:
             continue
-        if measurements_overlap(
-            entity["data"].get("start_at"),
-            entity["data"].get("end_at"),
-            other["data"].get("start_at"),
-            other["data"].get("end_at"),
-        ):
+        if other["status"] in ("scheduled", "pending_review") and _slot_overlaps(start, end, other):
             raise ConflictError("observation team is already committed in this window")
+
+    # Waiting applications re-compete by the latest candidate priority: a
+    # higher-priority requested observation for the same resource slot goes first.
+    competitors = {}
+    for other in list(telescope_observations) + list(team_observations):
+        if other["id"] == entity["id"]:
+            continue
+        competitors[other["id"]] = other
+    for other in competitors.values():
+        if other["status"] != "requested" or not _slot_overlaps(start, end, other):
+            continue
+        other_candidate = _find_one(lookup, "candidate", "id", other["data"].get("candidate_id"))
+        other_priority = other_candidate["data"].get("priority_score") if other_candidate else None
+        if (
+            other_priority is not None
+            and my_priority is not None
+            and float(other_priority) > float(my_priority)
+        ):
+            raise ConflictError("a higher-priority observation is already waiting for this window")
+
     return {"scheduled_by": actor.user_id}
 
 
@@ -180,8 +223,9 @@ class RuleEngine:
         },
         "observation": {
             "schedule": (("requested",), "scheduled"),
+            "confirm": (("pending_review",), "requested"),
             "complete": (("scheduled",), "completed"),
-            "withdraw": (("requested", "scheduled"), "withdrawn"),
+            "withdraw": (("requested", "pending_review", "scheduled"), "withdrawn"),
             "correct": (("requested", "scheduled"), "requested"),
         },
     }
@@ -222,7 +266,9 @@ class RuleEngine:
         "restrict": ("coordinator", "admin"),
         "restore": ("coordinator", "admin"),
         "schedule": ("coordinator", "admin"),
+        "confirm": ("analyst", "coordinator", "admin"),
         "complete": ("operator", "coordinator", "admin"),
+        ("observation", "withdraw"): ("coordinator", "admin"),
     }
     CUSTOM_CREATE = {
         "source": _validate_source,
@@ -235,6 +281,7 @@ class RuleEngine:
         ("candidate", "reclassify"): _validate_reclassify,
         ("candidate", "correct"): _validate_correct,
         ("observation", "schedule"): _validate_schedule,
+        ("observation", "confirm"): _validate_confirm,
         ("observation", "correct"): _validate_correct,
     }
 
