@@ -79,7 +79,8 @@ def _validate_observation(actor, data, lookup):
         raise ValidationError("telescope does not exist")
     if str(data.get("start_at")) >= str(data.get("end_at")):
         raise ValidationError("observation end must be after start")
-    return {"scheduled_team": data.get("team_id")}
+    # A fresh request does not hold a slot until it is scheduled.
+    return {"scheduled_team": data.get("team_id"), "holds_slot": False}
 
 
 def _validate_merge_measurement(actor, entity, data, lookup):
@@ -113,7 +114,21 @@ def _validate_merge_measurement(actor, entity, data, lookup):
 def _validate_reclassify(actor, entity, data, lookup):
     if data.get("new_type") not in {"grb", "supernova", "tde", "variable", "unknown"}:
         raise ValidationError("unsupported transient type")
-    return {"transient_type": data["new_type"], "previous_type": entity["data"].get("transient_type")}
+    magnitude = entity["data"].get("latest_magnitude")
+    measurements = entity["data"].get("measurements") or []
+    if magnitude is None and measurements:
+        magnitude = sorted(measurements, key=lambda item: str(item.get("observed_at")))[-1].get(
+            "magnitude"
+        )
+    patch = {
+        "transient_type": data["new_type"],
+        "previous_type": entity["data"].get("transient_type"),
+    }
+    # Reclassification itself changes priority, so pending observations must
+    # be re-planned against the new score.
+    if magnitude is not None:
+        patch["priority_score"] = calculate_priority(magnitude, data["new_type"])
+    return patch
 
 
 def _validate_correct(actor, entity, data, lookup):
@@ -122,30 +137,74 @@ def _validate_correct(actor, entity, data, lookup):
     return {"corrected_by": actor.user_id}
 
 
+# Statuses whose observations occupy the telescope/team window. Review-pending
+# observations keep their slot until the reviewer confirms or withdraws them.
+SLOT_HOLDING_STATUSES = ("scheduled", "review_pending")
+
+
+def _slot_conflicts(lookup, entity):
+    """Return the first telescope/team window clash for entity, or None.
+
+    Evaluated inside the write transaction by the service; every other
+    slot-holding observation visible there is committed, so two concurrent
+    schedules for the same telescope or team in one window cannot both pass.
+    """
+    window = (
+        entity["data"].get("start_at"),
+        entity["data"].get("end_at"),
+    )
+    telescope_id = entity["data"].get("telescope_id")
+    team_id = entity["data"].get("team_id")
+    for other in lookup("observation", "telescope_id", telescope_id) if lookup else []:
+        if other["id"] == entity["id"]:
+            continue
+        if other["status"] not in SLOT_HOLDING_STATUSES:
+            continue
+        if measurements_overlap(
+            window[0],
+            window[1],
+            other["data"].get("start_at"),
+            other["data"].get("end_at"),
+        ):
+            return ConflictError("telescope is already scheduled in this window")
+    for other in lookup("observation", "team_id", team_id) if lookup else []:
+        if other["id"] == entity["id"]:
+            continue
+        if other["status"] not in SLOT_HOLDING_STATUSES:
+            continue
+        if measurements_overlap(
+            window[0],
+            window[1],
+            other["data"].get("start_at"),
+            other["data"].get("end_at"),
+        ):
+            return ConflictError("observation team is already committed in this window")
+    return None
+
+
 def _validate_schedule(actor, entity, data, lookup):
-    observations = lookup("observation", "telescope_id", entity["data"].get("telescope_id")) if lookup else []
-    for other in observations:
-        if other["id"] == entity["id"] or other["status"] != "scheduled":
-            continue
-        if measurements_overlap(
-            entity["data"].get("start_at"),
-            entity["data"].get("end_at"),
-            other["data"].get("start_at"),
-            other["data"].get("end_at"),
-        ):
-            raise ConflictError("telescope is already scheduled in this window")
-    team_observations = lookup("observation", "team_id", entity["data"].get("team_id")) if lookup else []
-    for other in team_observations:
-        if other["id"] == entity["id"] or other["status"] != "scheduled":
-            continue
-        if measurements_overlap(
-            entity["data"].get("start_at"),
-            entity["data"].get("end_at"),
-            other["data"].get("start_at"),
-            other["data"].get("end_at"),
-        ):
-            raise ConflictError("observation team is already committed in this window")
-    return {"scheduled_by": actor.user_id}
+    conflict = _slot_conflicts(lookup, entity)
+    if conflict:
+        raise conflict
+    return {"scheduled_by": actor.user_id, "holds_slot": True}
+
+
+def _validate_confirm_review(actor, entity, data, lookup):
+    # Confirming a review gives up the held slot and hands the request back to
+    # the scheduling queue, where it re-competes with the latest priority.
+    return {"holds_slot": False, "reviewed_by": actor.user_id}
+
+
+def _validate_invalidate(actor, entity, data, lookup):
+    # Scheduled observations keep occupying telescope and team while a human
+    # reviews them; mere requests never held a slot.
+    return {"holds_slot": entity["status"] == "scheduled", "pending_reason": "manual review"}
+
+
+def _validate_withdraw_observation(actor, entity, data, lookup):
+    if not str(data.get("reason", "")).strip():
+        raise ValidationError("withdrawal reason is required")
+    return {"holds_slot": False, "withdrawn_by": actor.user_id}
 
 
 class RuleEngine:
@@ -169,7 +228,7 @@ class RuleEngine:
         "candidate": {
             "merge_measurement": (("detected", "triaged"), "triaged"),
             "triage": (("detected",), "triaged"),
-            "reclassify": (("triaged",), "triaged"),
+            "reclassify": (("detected", "triaged"), "triaged"),
             "correct": (("detected", "triaged", "classified"), "triaged"),
             "withdraw": (("detected", "triaged"), "withdrawn"),
             "classify": (("triaged",), "classified"),
@@ -181,8 +240,13 @@ class RuleEngine:
         "observation": {
             "schedule": (("requested",), "scheduled"),
             "complete": (("scheduled",), "completed"),
-            "withdraw": (("requested", "scheduled"), "withdrawn"),
-            "correct": (("requested", "scheduled"), "requested"),
+            "withdraw": (("requested", "scheduled", "review_pending"), "withdrawn"),
+            "correct": (("requested", "scheduled", "review_pending"), "requested"),
+            # A priority change invalidates not-yet-started work. Requests
+            # return to the queue for a re-plan; already-scheduled ones keep
+            # holding their slot while a reviewer decides.
+            "invalidate": (("requested", "scheduled"), "review_pending"),
+            "confirm_review": (("review_pending",), "requested"),
         },
     }
     CREATE_REQUIRED = {
@@ -203,6 +267,8 @@ class RuleEngine:
         ("observation", "schedule"): ("operator_id",),
         ("observation", "withdraw"): ("reason",),
         ("observation", "correct"): ("reason",),
+        ("observation", "confirm_review"): (),
+        ("observation", "invalidate"): (),
     }
     CREATE_ROLES = {
         "source": ("analyst", "admin"),
@@ -223,6 +289,8 @@ class RuleEngine:
         "restore": ("coordinator", "admin"),
         "schedule": ("coordinator", "admin"),
         "complete": ("operator", "coordinator", "admin"),
+        "invalidate": ("analyst", "operator", "coordinator", "supervisor", "admin"),
+        "confirm_review": ("coordinator", "supervisor", "admin"),
     }
     CUSTOM_CREATE = {
         "source": _validate_source,
@@ -235,6 +303,9 @@ class RuleEngine:
         ("candidate", "reclassify"): _validate_reclassify,
         ("candidate", "correct"): _validate_correct,
         ("observation", "schedule"): _validate_schedule,
+        ("observation", "confirm_review"): _validate_confirm_review,
+        ("observation", "invalidate"): _validate_invalidate,
+        ("observation", "withdraw"): _validate_withdraw_observation,
         ("observation", "correct"): _validate_correct,
     }
 
@@ -259,16 +330,20 @@ class RuleEngine:
             if value is None or value == "" or value == [] or value == {}:
                 raise ValidationError("missing required field: " + field)
 
-    def validate_create(self, actor, kind, data, lookup=None):
+    def validate_create(self, actor, kind, data, lookup=None, run_custom=True):
         kind = self.normalize_kind(kind)
         if kind not in self.INITIAL_STATUS:
             raise ValidationError("unknown kind: " + str(kind))
         self._ensure_role(actor, self.CREATE_ROLES.get(kind, ("admin",)))
         self._require(data, self.CREATE_REQUIRED.get(kind, ()))
+        if not run_custom:
+            return {}
         custom = self.CUSTOM_CREATE.get(kind)
         return custom(actor, data, lookup) if custom else {}
 
-    def validate_transition(self, actor, entity, action, data, lookup=None):
+    def validate_transition(
+        self, actor, entity, action, data, lookup=None, run_custom=True
+    ):
         kind = self.normalize_kind(entity["kind"])
         transition = self.TRANSITIONS.get(kind, {}).get(action)
         if not transition:
@@ -279,6 +354,8 @@ class RuleEngine:
         allowed_roles = self.ROLE_ACTIONS.get((kind, action), self.ROLE_ACTIONS.get(action, ("admin",)))
         self._ensure_role(actor, allowed_roles)
         self._require(data, self.ACTION_REQUIRED.get((kind, action), ()))
+        if not run_custom:
+            return next_status, dict(data)
         custom = self.CUSTOM_TRANSITIONS.get((kind, action))
         extra = custom(actor, entity, data, lookup) if custom else {}
         patch = dict(data)

@@ -138,6 +138,15 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
                     )
+                # POST /api/telescopes/<id>/dispatch: release-triggered
+                # re-competition of waiting requests at latest priority.
+                if (
+                    len(parts) == 4
+                    and parts[0] == "api"
+                    and rules.normalize_kind(parts[1]) == "telescope"
+                    and parts[3] == "dispatch"
+                ):
+                    return self._send(200, service.dispatch(actor, parts[2]))
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     return self._send(
